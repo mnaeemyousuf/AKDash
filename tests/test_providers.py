@@ -125,6 +125,49 @@ def test_fallback_does_not_hide_real_errors(http):
     assert len(calls) == 1
 
 
+def test_groq_skips_requests_too_large_for_free_tier(http):
+    calls, queue = http
+    llm = ai.make_llm("groq", "k")
+    with pytest.raises(ai.AIError, match="too large for the Groq free tier"):
+        llm.json("x" * 40_000, "u", {})
+    assert calls == []                                           # never sent
+    queue.append(ok('{"a": 1}'))
+    llm.json("short system", "u", {}, max_tokens=32000)
+    assert calls[0]["body"]["max_tokens"] < 8000                 # answer budget fits the free-tier cap
+
+
+def test_chain_mistral_gemini_groq_with_big_request(http):
+    """Mistral rate-limited -> Gemini answers; Groq is never tried for a big request."""
+    calls, queue = http
+    queue += [FakeResponse(429, {"message": "rate limit"})] * 6 + [ok('{"by": "gemini"}')]
+    llm = ai.FallbackLLM([ai.make_llm("mistral", "k"), ai.make_llm("gemini", "k"), ai.make_llm("groq", "k")])
+    assert llm.json("x" * 40_000, "u", {}) == {"by": "gemini"}
+    assert llm.used == ["Google AI Studio"]
+    assert not any("groq" in c["url"] for c in calls)
+
+
+def test_chain_reaches_groq_for_small_request(http):
+    calls, queue = http
+    queue += ([FakeResponse(429, {"message": "rate limit"})] * 6
+              + [FakeResponse(429, {"error": {"message": "quota exceeded"}})] * 6 + [ok('{"by": "groq"}')])
+    llm = ai.FallbackLLM([ai.make_llm("mistral", "k"), ai.make_llm("gemini", "k"), ai.make_llm("groq", "k")])
+    assert llm.json("small", "u", {}) == {"by": "groq"}
+    assert llm.used == ["Groq"]
+    assert "groq" in calls[-1]["url"]
+
+
+def test_gemma_without_system_role(http):
+    calls, queue = http
+    queue += [FakeResponse(400, {"error": {"message": "Developer instruction is not enabled for models/gemma-3"}}),
+              ok('{"ok": 1}')]
+    llm = ai.make_llm("gemini", "k")
+    assert llm.json("SYSTEM RULES", "the question", {}) == {"ok": 1}
+    retry = calls[1]["body"]["messages"]
+    assert [m["role"] for m in retry] == ["user"]
+    assert retry[0]["content"].startswith("INSTRUCTIONS:\nSYSTEM RULES") and "the question" in retry[0]["content"]
+    assert calls[1]["body"]["response_format"]["type"] == "json_schema"   # format kept; only the role changed
+
+
 def test_unknown_provider():
     with pytest.raises(ai.AIError, match="Unknown AI provider"):
         ai.make_llm("nope", "k")

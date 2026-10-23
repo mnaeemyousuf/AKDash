@@ -382,9 +382,11 @@ def get_llm():
     provider = (secret("provider") or "mistral").lower()
     key_name = ai.provider_key_name(provider)
     llm = ai.make_llm(provider, secret(key_name) if key_name else None, secret("model"), secret("base_url"))
-    # optional: fallback_providers = "gemini,openrouter" -> used in order when the main one is rate-limited
+    # fallback_providers = "gemini,groq" -> used in this order when the main one is rate-limited or too small.
+    # Not set: every other provider that has a key is used, in the default order below.
+    chain = secret("fallback_providers") or ",".join(ai.DEFAULT_FALLBACK_ORDER)
     backups = []
-    for name in [p.strip().lower() for p in (secret("fallback_providers") or "").split(",") if p.strip()]:
+    for name in [p.strip().lower() for p in chain.split(",") if p.strip()]:
         key_name = ai.provider_key_name(name)
         key = secret(key_name) if key_name else None
         if name == provider or (key_name and not key):
@@ -479,12 +481,22 @@ def run_generation(project: dict, tables: dict, previous_tables: dict | None, in
         return
     db.update_project(project["id"], instructions=instructions)
     vid = db.save_spec_version(project["id"], spec, "generate", "Generated from instructions")
+    ai_note = answered_by(llm)
     db.add_chat_message(project["id"], "assistant", "📊 Built a new dashboard from your instructions.",
-                        spec_version_id=vid)
+                        spec_version_id=vid, extra={"ai": ai_note} if ai_note else None)
     skipped = spec.pop("skipped_widgets", [])
-    st.session_state.flash = (f"Dashboard generated with {len(spec['widgets'])} widgets.",
+    st.session_state.flash = (f"Dashboard generated with {len(spec['widgets'])} widgets"
+                              + (f" · AI: {ai_note}" if ai_note else "") + ".",
                               [f"Left out because the data can't support them: {', '.join(skipped)}"] if skipped else [])
     st.rerun()
+
+
+def answered_by(llm) -> str:
+    """Which AI provider(s) answered, in order, e.g. "Mistral → Google AI Studio" (after a fallback)."""
+    used = getattr(llm, "used", None)
+    if used:
+        return " → ".join(dict.fromkeys(used))
+    return getattr(llm, "label", "")
 
 
 @st.cache_data(show_spinner=False, max_entries=20)
@@ -566,6 +578,8 @@ def render_chat_message(m: dict) -> None:
         if extra.get("sql"):
             with st.expander("SQL"):
                 st.code(extra["sql"], language="sql")
+        if extra.get("ai"):
+            st.caption(f"🤖 Answered by {extra['ai']}")
 
 
 def handle_chat(project: dict, spec: dict, tables: dict, snapshot_dir: str, prompt: str,
@@ -585,11 +599,13 @@ def handle_chat(project: dict, spec: dict, tables: dict, snapshot_dir: str, prom
         return
 
     db.add_chat_message(pid, "user", prompt)
+    ai_note = answered_by(llm)
     if result["kind"] == "update_spec":
         vid = db.save_spec_version(pid, result["spec"], "chat", prompt)
-        db.add_chat_message(pid, "assistant", result["reply"], spec_version_id=vid)
+        db.add_chat_message(pid, "assistant", result["reply"], spec_version_id=vid,
+                            extra={"ai": ai_note} if ai_note else None)
     else:
-        extra = {}
+        extra = {"ai": ai_note} if ai_note else {}
         if result.get("sql"):
             extra["sql"] = result["sql"]
         df = result.get("data")

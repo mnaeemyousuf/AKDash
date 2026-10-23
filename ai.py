@@ -89,8 +89,9 @@ PROVIDERS = {
                 "model": DEFAULT_MISTRAL_MODEL, "min_interval": 1.2},
     "openrouter": {"label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "key": "OPENROUTER_API_KEY",
                    "model": "openai/gpt-oss-120b:free", "min_interval": 3.1},
+    # Groq's free tier allows ~8,000 tokens per minute, so one request (prompt + answer) must fit in that
     "groq": {"label": "Groq", "base_url": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY",
-             "model": "openai/gpt-oss-120b", "min_interval": 2.1},
+             "model": "openai/gpt-oss-120b", "min_interval": 2.1, "request_tokens": 8000},
     "gemini": {"label": "Google AI Studio", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
                "key": "GEMINI_API_KEY", "model": "gemma-3-27b-it", "min_interval": 2.1},
     "ollama": {"label": "Ollama", "base_url": "http://localhost:11434/v1", "key": None,
@@ -99,6 +100,10 @@ PROVIDERS = {
                           "model": None, "min_interval": 0.0},
 }
 _LAST_CALL: dict[str, float] = {}
+# Backup order when fallback_providers isn't set (only providers with an API key are used):
+# Mistral (JSON-schema support, proven on AKDash) -> Gemma on Google AI Studio -> Groq (strongest model, but its
+# free tier only fits small requests such as chat answers and query fixes) -> OpenRouter.
+DEFAULT_FALLBACK_ORDER = ["mistral", "gemini", "groq", "openrouter"]
 
 
 class OpenAICompatLLM:
@@ -121,9 +126,12 @@ class OpenAICompatLLM:
         self.api_key = api_key
         self.temperature = temperature
         self.min_interval = preset["min_interval"]
+        self.request_tokens = preset.get("request_tokens")     # free-tier cap on prompt + answer, if any
         self.timeout = 900 if provider == "ollama" else 300   # local models can be slow
         # response_format support differs per provider/model: json_schema -> json_object -> plain prompt
         self.format_mode = "json_schema"
+        # some models (e.g. Gemma on Google's API) reject system messages: then instructions go in the user turn
+        self.system_role = True
 
     @property
     def schema_mode(self) -> bool:   # kept for older callers/tests
@@ -197,22 +205,37 @@ class OpenAICompatLLM:
 
     def json(self, system: str, user: str | None, schema: dict, max_tokens: int = 32000,
              messages: list[dict] | None = None) -> dict:
-        convo = messages if messages is not None else [{"role": "user", "content": user}]
-        schema_text = ("\n\nReturn ONLY a JSON object (no markdown, no explanation) that follows this JSON schema "
-                       "exactly:\n" + json.dumps(schema))
-        for attempt in range(4):
-            body = {
-                "model": self.model,
-                "temperature": self.temperature,
-                "max_tokens": max_tokens,
-                "messages": [{"role": "system", "content": system + schema_text}] + self._merge_roles(convo),
-            }
+        convo = self._merge_roles(messages if messages is not None else [{"role": "user", "content": user}])
+        instructions = system + ("\n\nReturn ONLY a JSON object (no markdown, no explanation) that follows this "
+                                 "JSON schema exactly:\n" + json.dumps(schema))
+        if self.request_tokens:
+            # rough size check (~3.5 characters per token) so a request that can't fit isn't sent at all
+            prompt_tokens = int((len(instructions) + sum(len(m["content"]) for m in convo)) / 3.5)
+            if prompt_tokens + 1500 > self.request_tokens:
+                raise AIError(f"This request is too large for the {self.label} free tier "
+                              f"(about {prompt_tokens:,} tokens; limit {self.request_tokens:,} per request).")
+            max_tokens = min(max_tokens, self.request_tokens - prompt_tokens)
+        for attempt in range(5):
+            if self.system_role:
+                msgs = [{"role": "system", "content": instructions}] + convo
+            else:
+                first = convo[0]
+                msgs = ([{"role": "user", "content": f"INSTRUCTIONS:\n{instructions}\n\n{first['content']}"}]
+                        + convo[1:] if first["role"] == "user"
+                        else [{"role": "user", "content": f"INSTRUCTIONS:\n{instructions}"}] + convo)
+            body = {"model": self.model, "temperature": self.temperature, "max_tokens": max_tokens, "messages": msgs}
             fmt = self._response_format(schema)
             if fmt:
                 body["response_format"] = fmt
             try:
                 data = self._post(body)
             except _LLMHTTPError as e:
+                low = e.text.lower()
+                if (e.status in (400, 422) and self.system_role
+                        and ("instruction is not enabled" in low or "system role" in low
+                             or ("system" in low and "not supported" in low))):
+                    self.system_role = False   # e.g. Gemma: put the instructions in the user message instead
+                    continue
                 if e.status in (400, 422) and self.format_mode != "none" and not _is_model_error(e.text):
                     # this provider/model rejected the output format: try a simpler one
                     self.format_mode = "json_object" if self.format_mode == "json_schema" else "none"
@@ -303,12 +326,14 @@ class FallbackLLM:
     Lets small free tiers (e.g. Groq + Google + OpenRouter) add up to more daily capacity."""
 
     SWITCH_ON = ("rate limit", "did not respond", "could not reach", "not included in your", "not available on your",
-                 "returned an error (5", "insufficient credits", "quota")
+                 "returned an error (5", "returned an error (413", "too large", "too long", "context length",
+                 "insufficient credits", "quota", "invalid response")
 
     def __init__(self, clients: list):
         if not clients:
             raise AIError("No AI provider is configured. Add an API key to .streamlit/secrets.toml.")
         self.clients = clients
+        self.used: list[str] = []   # labels of the providers that answered (shown to the user)
 
     def __getattr__(self, name):
         return getattr(self.clients[0], name)
@@ -318,7 +343,9 @@ class FallbackLLM:
         errors = []
         for client in self.clients:
             try:
-                return client.json(system, user, schema, max_tokens=max_tokens, messages=messages)
+                out = client.json(system, user, schema, max_tokens=max_tokens, messages=messages)
+                self.used.append(getattr(client, "label", "AI"))
+                return out
             except AIError as e:
                 errors.append(str(e))
                 if not any(s in str(e).lower() for s in self.SWITCH_ON):

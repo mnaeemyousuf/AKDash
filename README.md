@@ -29,15 +29,20 @@ AKDash works with any OpenAI-compatible API, so you can run it on **free, open-s
 | `openai_compatible` | vLLM, LM Studio, etc. (`base_url` + `model`) | `LLM_API_KEY` | Depends |
 | `mistral` / `anthropic` | Mistral / Claude models | `MISTRAL_API_KEY` / `ANTHROPIC_API_KEY` | Paid / free tiers |
 
-- **Combining free tiers:** set `fallback_providers = "groq,openrouter"`. When the main provider is rate-limited, the next one answers. Only providers that have a key are used.
+- **Backup chain:** the main `provider` is tried first. When it is rate-limited, out of quota, unreachable, or the request is too large for its free tier, the next provider answers.
+  - **Default order:** Mistral → Gemini (Gemma) → Groq → OpenRouter. Only providers with a key are used, so adding `MISTRAL_API_KEY`, `GEMINI_API_KEY` and `GROQ_API_KEY` is enough.
+  - **Custom order:** set `fallback_providers = "gemini,groq"`. Backup models are set with `gemini_model`, `groq_model` and so on.
+  - **Groq:** its free tier only fits requests up to about 8,000 tokens. Bigger requests (designing a dashboard) skip Groq without calling it, while small ones (chat answers, query fixes) can use it.
+  - **Gemma on Google's API** doesn't accept system messages, so the instructions are sent in the user message automatically.
+  - **Visibility:** the app shows which AI answered, for example "AI: Mistral → Google AI Studio".
 - **Output format:** the app asks for JSON-schema output first, falls back to JSON mode, and finally to plain-prompt JSON. This lets models without structured-output support still work.
 
 ```toml
-provider = "gemini"
-GEMINI_API_KEY = "your-key"
-model = "gemma-3-27b-it"
-fallback_providers = "groq,openrouter"
-GROQ_API_KEY = "your-groq-key"
+provider = "mistral"
+model = "ministral-14b-latest"
+MISTRAL_API_KEY = "your-mistral-key"
+GEMINI_API_KEY = "your-gemini-key"   # backup 1 (Gemma)
+GROQ_API_KEY = "your-groq-key"       # backup 2 (gpt-oss-120b)
 signup_code = ""                     # optional: a code required to create new accounts
 ```
 
