@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 220 64" role="img" aria-label="AKDash">
+  <defs>
+    <linearGradient id="akBg2" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#121838"/>
+      <stop offset="1" stop-color="#34449f"/>
+    </linearGradient>
+    <linearGradient id="akGold2" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f4d98b"/>
+      <stop offset="1" stop-color="#c79a3a"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="url(#akBg2)"/>
+  <rect x="13" y="35" width="9" height="17" rx="2.5" fill="#ffffff" opacity="0.92"/>
+  <rect x="42" y="15" width="9" height="37" rx="2.5" fill="#ffffff" opacity="0.92"/>
+  <path d="M7 45 C 16 33, 22 50, 31 36 S 47 18, 57 12" fill="none" stroke="url(#akGold2)" stroke-width="3.6"
+        stroke-linecap="round"/>
+  <rect x="27.5" y="25" width="9" height="27" rx="2.5" fill="#ffffff"/>
+  <circle cx="57" cy="12" r="3.2" fill="#f4d98b"/>
+  <text x="78" y="42" font-family="Inter, Segoe UI, sans-serif" font-size="30" font-weight="800"
+        letter-spacing="-0.5" fill="#34449f">AK<tspan fill="#c79a3a" font-weight="600">Dash</tspan></text>
+</svg>

@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.claude/
+app.db
+*.db
+data/
+.streamlit/secrets.toml
+samples/*.xlsx
+samples/*.csv
+samples/*.pdf

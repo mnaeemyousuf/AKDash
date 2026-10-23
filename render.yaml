@@ -1,0 +1,25 @@
+# Render Blueprint for AKDash (https://render.com/docs/blueprint-spec)
+services:
+  - type: web
+    name: akdash
+    runtime: python
+    plan: free                     # use "starter" + the disk below to keep data across restarts and deploys
+    buildCommand: pip install -r requirements.txt
+    startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0 --server.headless true
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.8"
+      - key: provider
+        value: mistral
+      - key: model
+        value: ministral-14b-latest
+      - key: MISTRAL_API_KEY       # set the value yourself in the Render dashboard (never commit it)
+        sync: false
+      - key: signup_code           # optional: a code required to create accounts
+        sync: false
+    # Persistent storage (paid plans only). Uncomment together with plan: starter.
+    # disk:
+    #   name: akdash-data
+    #   mountPath: /var/data
+    #   sizeGB: 1
+    # and add env vars: AKDASH_DB=/var/data/app.db  AKDASH_DATA=/var/data/data
