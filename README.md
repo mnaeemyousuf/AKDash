@@ -22,13 +22,19 @@ AKDash works with any OpenAI-compatible API, so you can run it on **free, open-s
 
 | `provider` | Models (defaults) | Key | Cost |
 |---|---|---|---|
-| `gemini` | Google's open **Gemma** models (`gemma-3-27b-it`) | `GEMINI_API_KEY` from aistudio.google.com | Free tier |
-| `groq` | `openai/gpt-oss-120b`, Llama, Qwen | `GROQ_API_KEY` from console.groq.com | Free tier (small daily token cap) |
+| `gemini` | Google's open **Gemma 4** models (`gemma-4-31b-it`) | `GEMINI_API_KEY` from aistudio.google.com | Free tier |
+| `groq` | `openai/gpt-oss-120b`, Qwen | `GROQ_API_KEY` from console.groq.com | Free tier (small daily token cap) |
 | `openrouter` | `openai/gpt-oss-120b:free` and other `:free` models | `OPENROUTER_API_KEY` from openrouter.ai | Free models; the daily limit rises after a one-time $10 credit |
 | `ollama` | Any model you pull, e.g. `qwen3:14b`, `gpt-oss:20b` | None | Free and private; needs a capable machine |
 | `openai_compatible` | vLLM, LM Studio, etc. (`base_url` + `model`) | `LLM_API_KEY` | Depends |
 | `mistral` / `anthropic` | Mistral / Claude models | `MISTRAL_API_KEY` / `ANTHROPIC_API_KEY` | Paid / free tiers |
 
+- **Free-tier models are picked automatically.** Each provider has a list of free models:
+  - **Mistral:** `ministral-14b-latest` → `ministral-8b-latest` → `open-mistral-nemo`
+  - **Gemini:** `gemma-4-31b-it` → `gemma-4-26b-a4b-it` → `gemma-3-27b-it`
+  - **Groq:** `openai/gpt-oss-120b` → `qwen/qwen3.6-27b` → `openai/gpt-oss-20b`
+
+  If your key's plan doesn't offer a model, the next one is used. Run `python check_ai.py` to see which models work with your keys.
 - **Backup chain:** the main `provider` is tried first. When it is rate-limited, out of quota, unreachable, or the request is too large for its free tier, the next provider answers.
   - **Default order:** Mistral → Gemini (Gemma) → Groq → OpenRouter. Only providers with a key are used, so adding `MISTRAL_API_KEY`, `GEMINI_API_KEY` and `GROQ_API_KEY` is enough.
   - **Custom order:** set `fallback_providers = "gemini,groq"`. Backup models are set with `gemini_model`, `groq_model` and so on.

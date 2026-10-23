@@ -84,20 +84,26 @@ class ClaudeLLM:
 
 # OpenAI-compatible chat-completions providers. Open-source models are available through all of these except
 # Mistral's own API; "ollama" runs an open model on your own computer or server (free and private).
+# "models": free-tier models in order of preference. If a model isn't available on the key's plan
+# (not found / 0 requests allowed), the next one is tried automatically.
 PROVIDERS = {
+    # verified on a free key (Oct 2026): mistral-large/medium/small allow 0 requests on the free plan
     "mistral": {"label": "Mistral", "base_url": "https://api.mistral.ai/v1", "key": "MISTRAL_API_KEY",
-                "model": DEFAULT_MISTRAL_MODEL, "min_interval": 1.2},
+                "models": [DEFAULT_MISTRAL_MODEL, "ministral-8b-latest", "open-mistral-nemo"], "min_interval": 1.2},
     "openrouter": {"label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "key": "OPENROUTER_API_KEY",
-                   "model": "openai/gpt-oss-120b:free", "min_interval": 3.1},
+                   "models": ["openai/gpt-oss-120b:free", "qwen/qwen3-coder:free"], "min_interval": 3.1},
     # Groq's free tier allows ~8,000 tokens per minute, so one request (prompt + answer) must fit in that
     "groq": {"label": "Groq", "base_url": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY",
-             "model": "openai/gpt-oss-120b", "min_interval": 2.1, "request_tokens": 8000},
+             "models": ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"], "min_interval": 2.1,
+             "request_tokens": 8000},
+    # Google AI Studio's free tier serves the open Gemma 4 models
     "gemini": {"label": "Google AI Studio", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-               "key": "GEMINI_API_KEY", "model": "gemma-3-27b-it", "min_interval": 2.1},
+               "key": "GEMINI_API_KEY", "models": ["gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemma-3-27b-it"],
+               "min_interval": 2.1},
     "ollama": {"label": "Ollama", "base_url": "http://localhost:11434/v1", "key": None,
-               "model": "qwen3:14b", "min_interval": 0.0},
+               "models": ["qwen3:14b"], "min_interval": 0.0},
     "openai_compatible": {"label": "OpenAI-compatible API", "base_url": None, "key": "LLM_API_KEY",
-                          "model": None, "min_interval": 0.0},
+                          "models": [], "min_interval": 0.0},
 }
 _LAST_CALL: dict[str, float] = {}
 # Backup order when fallback_providers isn't set (only providers with an API key are used):
@@ -115,7 +121,9 @@ class OpenAICompatLLM:
         preset = PROVIDERS.get(provider, PROVIDERS["openai_compatible"])
         self.provider, self.label = provider, preset["label"]
         self.base_url = (base_url or preset["base_url"] or "").rstrip("/")
-        self.model = model or preset["model"]
+        # a model set in secrets.toml is tried first, then the provider's other free models
+        self.models = list(dict.fromkeys(([model] if model else []) + preset["models"]))
+        self.model = self.models[0] if self.models else None
         if not self.base_url:
             raise AIError("No AI base_url set. Add base_url to .streamlit/secrets.toml.")
         if not self.model:
@@ -203,8 +211,23 @@ class OpenAICompatLLM:
             return {"type": "json_object"}
         return None   # the model can't constrain output: rely on the prompt + tolerant parsing
 
+    MODEL_UNAVAILABLE = ("was not found", "not included in your", "not available on your")
+
     def json(self, system: str, user: str | None, schema: dict, max_tokens: int = 32000,
              messages: list[dict] | None = None) -> dict:
+        """Ask the current model; if the key's plan doesn't offer it, move on to the next free model."""
+        while True:
+            try:
+                return self._json_one_model(system, user, schema, max_tokens, messages)
+            except AIError as e:
+                if not any(s in str(e) for s in self.MODEL_UNAVAILABLE) or len(self.models) < 2:
+                    raise
+                self.models.pop(0)                 # remember for the next calls too
+                self.model = self.models[0]
+                self.format_mode, self.system_role = "json_schema", True
+
+    def _json_one_model(self, system: str, user: str | None, schema: dict, max_tokens: int,
+                        messages: list[dict] | None) -> dict:
         convo = self._merge_roles(messages if messages is not None else [{"role": "user", "content": user}])
         instructions = system + ("\n\nReturn ONLY a JSON object (no markdown, no explanation) that follows this "
                                  "JSON schema exactly:\n" + json.dumps(schema))
@@ -241,7 +264,7 @@ class OpenAICompatLLM:
                     self.format_mode = "json_object" if self.format_mode == "json_schema" else "none"
                     continue
                 if e.status == 403 and "tier" in e.text.lower():
-                    default = PROVIDERS.get(self.provider, {}).get("model")
+                    default = (PROVIDERS.get(self.provider, {}).get("models") or [None])[0]
                     raise AIError(f"Model '{self.model}' is not available on your {self.label} plan. "
                                   + (f'Set model = "{default}" ' if default else "Choose another model ")
                                   + "in .streamlit/secrets.toml and restart the app.")

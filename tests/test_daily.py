@@ -213,22 +213,23 @@ def test_mistral_errors_are_friendly(mistral_calls):
         ai.MistralLLM(None)
 
 
-def test_mistral_model_not_on_plan_explains_fix(mistral_calls):
+def test_mistral_model_not_on_plan_switches_to_free_model(mistral_calls):
     calls, queue = mistral_calls
-    queue.append(FakeResponse(403, {"message": "This model is not available in your subscription tier",
-                                    "type": "tier_not_allowed"}))
-    with pytest.raises(ai.AIError, match="not available on your Mistral plan.*ministral-14b-latest"):
-        ai.MistralLLM("k", "mistral-large-latest").json("s", "u", {})
+    queue += [FakeResponse(403, {"message": "This model is not available in your subscription tier",
+                                 "type": "tier_not_allowed"}), ok('{"ok": 1}')]
+    assert ai.MistralLLM("k", "mistral-large-latest").json("s", "u", {}) == {"ok": 1}
+    assert [c["model"] for c in calls] == ["mistral-large-latest", "ministral-14b-latest"]
 
 
 def test_mistral_zero_rate_limit_fails_fast(mistral_calls):
     calls, queue = mistral_calls
-    resp = FakeResponse(429, {"message": "Rate limit exceeded"})
-    resp.headers = {"x-ratelimit-limit-req-minute": "0"}
-    queue.append(resp)
+    for _ in range(4):   # the requested model + the 3 free models, none allowed on this plan
+        resp = FakeResponse(429, {"message": "Rate limit exceeded"})
+        resp.headers = {"x-ratelimit-limit-req-minute": "0"}
+        queue.append(resp)
     with pytest.raises(ai.AIError, match="not included in your Mistral plan"):
         ai.MistralLLM("k", "mistral-medium-latest").json("s", "u", {})
-    assert len(calls) == 1   # no pointless retries
+    assert len(calls) == 4   # one call per model, no pointless retries
 
 
 def test_mistral_other_errors_include_mistral_message(mistral_calls):

@@ -36,7 +36,7 @@ def http(monkeypatch):
 @pytest.mark.parametrize("provider,url,model", [
     ("openrouter", "https://openrouter.ai/api/v1/chat/completions", "openai/gpt-oss-120b:free"),
     ("groq", "https://api.groq.com/openai/v1/chat/completions", "openai/gpt-oss-120b"),
-    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemma-3-27b-it"),
+    ("gemini", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "gemma-4-31b-it"),
     ("mistral", "https://api.mistral.ai/v1/chat/completions", "ministral-14b-latest"),
 ])
 def test_presets(http, provider, url, model):
@@ -94,11 +94,12 @@ def test_format_fallback_chain_to_plain_prompt(http):
     assert "JSON schema" in calls[2]["body"]["messages"][0]["content"]   # schema still in the prompt
 
 
-def test_unknown_model_is_reported(http):
+def test_unknown_model_is_reported_after_all_free_models(http):
     calls, queue = http
-    queue.append(FakeResponse(404, {"error": {"message": "model not found"}}))
+    queue += [FakeResponse(404, {"error": {"message": "model not found"}})] * 4   # "nope" + 3 free models
     with pytest.raises(ai.AIError, match="was not found"):
         ai.make_llm("groq", "k", "nope").json("s", "u", {})
+    assert len(calls) == 4
 
 
 def test_openrouter_error_message_is_shown(http):
@@ -166,6 +167,34 @@ def test_gemma_without_system_role(http):
     assert [m["role"] for m in retry] == ["user"]
     assert retry[0]["content"].startswith("INSTRUCTIONS:\nSYSTEM RULES") and "the question" in retry[0]["content"]
     assert calls[1]["body"]["response_format"]["type"] == "json_schema"   # format kept; only the role changed
+
+
+def test_free_model_auto_switch(http):
+    """The first free model isn't on the key's plan -> the next one is used, and remembered."""
+    calls, queue = http
+    queue += [FakeResponse(404, {"error": {"message": "models/gemma-4-31b-it is not found"}}),
+              ok('{"ok": 1}'), ok('{"ok": 2}')]
+    llm = ai.make_llm("gemini", "k")
+    assert llm.json("s", "u", {}) == {"ok": 1}
+    assert [c["body"]["model"] for c in calls] == ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
+    llm.json("s", "u", {})
+    assert calls[-1]["body"]["model"] == "gemma-4-26b-a4b-it"
+
+
+def test_mistral_zero_quota_model_switches(http):
+    calls, queue = http
+    queue += [FakeResponse(429, {"message": "Rate limit exceeded"}, {"x-ratelimit-limit-req-minute": "0"}),
+              ok('{"ok": 1}')]
+    llm = ai.make_llm("mistral", "k", "mistral-large-latest")
+    assert llm.json("s", "u", {}) == {"ok": 1}
+    assert [c["body"]["model"] for c in calls] == ["mistral-large-latest", "ministral-14b-latest"]
+
+
+def test_model_from_secrets_tried_first(http):
+    calls, queue = http
+    queue.append(ok('{"ok": 1}'))
+    ai.make_llm("groq", "k", "qwen/qwen3.6-27b").json("s", "u", {})
+    assert calls[0]["body"]["model"] == "qwen/qwen3.6-27b"
 
 
 def test_unknown_provider():
