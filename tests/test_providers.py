@@ -96,10 +96,10 @@ def test_format_fallback_chain_to_plain_prompt(http):
 
 def test_unknown_model_is_reported_after_all_free_models(http):
     calls, queue = http
-    queue += [FakeResponse(404, {"error": {"message": "model not found"}})] * 4   # "nope" + 3 free models
+    queue += [FakeResponse(404, {"error": {"message": "model not found"}})] * 3   # "nope" + 2 free models
     with pytest.raises(ai.AIError, match="was not found"):
         ai.make_llm("groq", "k", "nope").json("s", "u", {})
-    assert len(calls) == 4
+    assert len(calls) == 3
 
 
 def test_openrouter_error_message_is_shown(http):
@@ -178,6 +178,15 @@ def test_free_model_auto_switch(http):
     assert llm.json("s", "u", {}) == {"ok": 1}
     assert [c["body"]["model"] for c in calls] == ["gemma-4-31b-it", "gemma-4-26b-a4b-it"]
     llm.json("s", "u", {})
+    assert calls[-1]["body"]["model"] == "gemma-4-26b-a4b-it"
+
+
+def test_overloaded_model_switches_to_next_model(http):
+    calls, queue = http
+    queue += [FakeResponse(503, {"error": {"message": "This model is currently experiencing high demand"}})] * 6
+    queue.append(ok('{"ok": 1}'))
+    llm = ai.make_llm("gemini", "k")
+    assert llm.json("s", "u", {}) == {"ok": 1}
     assert calls[-1]["body"]["model"] == "gemma-4-26b-a4b-it"
 
 

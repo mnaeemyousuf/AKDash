@@ -94,11 +94,11 @@ PROVIDERS = {
                    "models": ["openai/gpt-oss-120b:free", "qwen/qwen3-coder:free"], "min_interval": 3.1},
     # Groq's free tier allows ~8,000 tokens per minute, so one request (prompt + answer) must fit in that
     "groq": {"label": "Groq", "base_url": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY",
-             "models": ["openai/gpt-oss-120b", "qwen/qwen3.6-27b", "openai/gpt-oss-20b"], "min_interval": 2.1,
+             "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b"], "min_interval": 2.1,
              "request_tokens": 8000},
     # Google AI Studio's free tier serves the open Gemma 4 models
     "gemini": {"label": "Google AI Studio", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
-               "key": "GEMINI_API_KEY", "models": ["gemma-4-31b-it", "gemma-4-26b-a4b-it", "gemma-3-27b-it"],
+               "key": "GEMINI_API_KEY", "models": ["gemma-4-31b-it", "gemma-4-26b-a4b-it"],
                "min_interval": 2.1},
     "ollama": {"label": "Ollama", "base_url": "http://localhost:11434/v1", "key": None,
                "models": ["qwen3:14b"], "min_interval": 0.0},
@@ -211,7 +211,9 @@ class OpenAICompatLLM:
             return {"type": "json_object"}
         return None   # the model can't constrain output: rely on the prompt + tolerant parsing
 
-    MODEL_UNAVAILABLE = ("was not found", "not included in your", "not available on your")
+    # move on to the provider's next free model when a model isn't on the plan, or is overloaded right now
+    MODEL_UNAVAILABLE = ("was not found", "not included in your", "not available on your",
+                         "returned an error (5", "did not respond", "high demand")
 
     def json(self, system: str, user: str | None, schema: dict, max_tokens: int = 32000,
              messages: list[dict] | None = None) -> dict:
