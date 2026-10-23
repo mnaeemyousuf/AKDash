@@ -378,11 +378,24 @@ def cached_results(snapshot_dir: str, widgets_json: str, filters_key: tuple, _fi
 
 
 def get_llm():
-    """AI client from secrets.toml (provider = "mistral" or "anthropic"), told who the logged-in user is."""
+    """AI client from secrets.toml / environment (provider, model, base_url, API key), told who the user is."""
     provider = (secret("provider") or "mistral").lower()
-    key_name = "MISTRAL_API_KEY" if provider == "mistral" else "ANTHROPIC_API_KEY"
-    key = secret(key_name)
-    return ai.PersonaLLM(ai.make_llm(provider, key, secret("model")), auth.persona_text(auth.current_user()))
+    key_name = ai.provider_key_name(provider)
+    llm = ai.make_llm(provider, secret(key_name) if key_name else None, secret("model"), secret("base_url"))
+    # optional: fallback_providers = "gemini,openrouter" -> used in order when the main one is rate-limited
+    backups = []
+    for name in [p.strip().lower() for p in (secret("fallback_providers") or "").split(",") if p.strip()]:
+        key_name = ai.provider_key_name(name)
+        key = secret(key_name) if key_name else None
+        if name == provider or (key_name and not key):
+            continue   # skip duplicates and providers without a key
+        try:
+            backups.append(ai.make_llm(name, key, secret(f"{name}_model")))
+        except ai.AIError:
+            continue
+    if backups:
+        llm = ai.FallbackLLM([llm] + backups)
+    return ai.PersonaLLM(llm, auth.persona_text(auth.current_user()))
 
 
 # ---------- sidebar filters ----------

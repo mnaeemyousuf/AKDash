@@ -9,11 +9,17 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.8"
-      - key: provider
-        value: mistral
+      - key: provider              # gemini | groq | openrouter | ollama | openai_compatible | mistral | anthropic
+        value: gemini
       - key: model
-        value: ministral-14b-latest
-      - key: MISTRAL_API_KEY       # set the value yourself in the Render dashboard (never commit it)
+        value: gemma-3-27b-it
+      - key: fallback_providers    # used in order when the main provider is rate-limited
+        value: groq,openrouter
+      - key: GEMINI_API_KEY        # set key values yourself in the Render dashboard (never commit them)
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
         sync: false
       - key: signup_code           # optional: a code required to create accounts
         sync: false

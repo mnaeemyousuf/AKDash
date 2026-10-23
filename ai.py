@@ -1,5 +1,5 @@
-"""AI calls (Mistral or Claude: spec generation, query fixing, insights, chat) and the pipeline that checks every
-AI query by running it."""
+"""AI calls (any OpenAI-compatible provider incl. open-source models, or Claude: spec generation, query fixing,
+insights, chat) and the pipeline that checks every AI query by running it."""
 from __future__ import annotations
 
 import copy
@@ -13,9 +13,7 @@ import engine
 import prompts
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
-DEFAULT_MISTRAL_MODEL = "ministral-14b-latest"    # strongest model the free tier can call (30 requests/min)
-MISTRAL_MIN_INTERVAL = 1.2                         # seconds between Mistral calls (free tier: ~1 request/s)
-_MISTRAL_LAST_CALL = [0.0]
+DEFAULT_MISTRAL_MODEL = "ministral-14b-latest"    # strongest model Mistral's free tier can call (30 requests/min)
 CHAT_HISTORY_MESSAGES = 10
 CHAT_SYSTEM = prompts.CHAT_SYSTEM.format(spec_rules=prompts.SPEC_SYSTEM)
 # models that accept the server-side refusal fallback ("default" routing) on the Claude API
@@ -84,18 +82,52 @@ class ClaudeLLM:
             raise AIError("The AI returned an invalid response. Please try again.")
 
 
-class MistralLLM:
-    """Mistral chat completions over plain HTTPS, with the same .json() interface as ClaudeLLM."""
+# OpenAI-compatible chat-completions providers. Open-source models are available through all of these except
+# Mistral's own API; "ollama" runs an open model on your own computer or server (free and private).
+PROVIDERS = {
+    "mistral": {"label": "Mistral", "base_url": "https://api.mistral.ai/v1", "key": "MISTRAL_API_KEY",
+                "model": DEFAULT_MISTRAL_MODEL, "min_interval": 1.2},
+    "openrouter": {"label": "OpenRouter", "base_url": "https://openrouter.ai/api/v1", "key": "OPENROUTER_API_KEY",
+                   "model": "openai/gpt-oss-120b:free", "min_interval": 3.1},
+    "groq": {"label": "Groq", "base_url": "https://api.groq.com/openai/v1", "key": "GROQ_API_KEY",
+             "model": "openai/gpt-oss-120b", "min_interval": 2.1},
+    "gemini": {"label": "Google AI Studio", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+               "key": "GEMINI_API_KEY", "model": "gemma-3-27b-it", "min_interval": 2.1},
+    "ollama": {"label": "Ollama", "base_url": "http://localhost:11434/v1", "key": None,
+               "model": "qwen3:14b", "min_interval": 0.0},
+    "openai_compatible": {"label": "OpenAI-compatible API", "base_url": None, "key": "LLM_API_KEY",
+                          "model": None, "min_interval": 0.0},
+}
+_LAST_CALL: dict[str, float] = {}
 
-    URL = "https://api.mistral.ai/v1/chat/completions"
 
-    def __init__(self, api_key: str | None, model: str = DEFAULT_MISTRAL_MODEL, temperature: float = 0.2):
-        if not api_key:
-            raise AIError("No Mistral API key found. Add MISTRAL_API_KEY to .streamlit/secrets.toml.")
+class OpenAICompatLLM:
+    """Any OpenAI-compatible /chat/completions API (Mistral, OpenRouter, Groq, Google, Ollama, vLLM, ...)
+    over plain HTTPS, with the same .json() interface as ClaudeLLM."""
+
+    def __init__(self, provider: str, api_key: str | None, model: str | None = None, base_url: str | None = None,
+                 temperature: float = 0.2):
+        preset = PROVIDERS.get(provider, PROVIDERS["openai_compatible"])
+        self.provider, self.label = provider, preset["label"]
+        self.base_url = (base_url or preset["base_url"] or "").rstrip("/")
+        self.model = model or preset["model"]
+        if not self.base_url:
+            raise AIError("No AI base_url set. Add base_url to .streamlit/secrets.toml.")
+        if not self.model:
+            raise AIError("No AI model set. Add model to .streamlit/secrets.toml.")
+        if preset["key"] and not api_key:
+            raise AIError(f"No {self.label} API key found. Add {preset['key']} to .streamlit/secrets.toml "
+                          f"(or as an environment variable).")
         self.api_key = api_key
-        self.model = model
         self.temperature = temperature
-        self.schema_mode = True   # switches to JSON mode if the API rejects json_schema
+        self.min_interval = preset["min_interval"]
+        self.timeout = 900 if provider == "ollama" else 300   # local models can be slow
+        # response_format support differs per provider/model: json_schema -> json_object -> plain prompt
+        self.format_mode = "json_schema"
+
+    @property
+    def schema_mode(self) -> bool:   # kept for older callers/tests
+        return self.format_mode == "json_schema"
 
     @staticmethod
     def _merge_roles(messages: list[dict]) -> list[dict]:
@@ -112,67 +144,87 @@ class MistralLLM:
         import time
 
         import requests
+        headers = {"Accept": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        if self.provider == "openrouter":
+            headers["X-Title"] = "AKDash"
         attempts = 6
         for attempt in range(attempts):
-            # the free tier allows about 1 request per second: keep calls spaced out
-            wait = _MISTRAL_LAST_CALL[0] + MISTRAL_MIN_INTERVAL - time.monotonic()
+            # free tiers allow only a few requests per minute: keep calls to one provider spaced out
+            wait = _LAST_CALL.get(self.provider, 0.0) + self.min_interval - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
-            _MISTRAL_LAST_CALL[0] = time.monotonic()
+            _LAST_CALL[self.provider] = time.monotonic()
             try:
-                r = requests.post(self.URL, json=body, timeout=300,
-                                  headers={"Authorization": f"Bearer {self.api_key}", "Accept": "application/json"})
+                r = requests.post(f"{self.base_url}/chat/completions", json=body, timeout=self.timeout,
+                                  headers=headers)
             except requests.RequestException:
                 if attempt == attempts - 1:
-                    raise AIError("Could not reach the Mistral API. Check your internet connection.")
+                    hint = (" Is Ollama running (ollama serve) and is the model pulled?"
+                            if self.provider == "ollama" else " Check your internet connection.")
+                    raise AIError(f"Could not reach the {self.label} API.{hint}")
                 time.sleep(2 ** attempt)
                 continue
-            if r.status_code == 429 and getattr(r, "headers", {}).get("x-ratelimit-limit-req-minute") == "0":
+            r_headers = getattr(r, "headers", {}) or {}
+            if r.status_code == 429 and r_headers.get("x-ratelimit-limit-req-minute") == "0":
                 # the plan allows 0 requests/minute for this model: retrying cannot help
-                raise AIError(f"Model '{self.model}' is not included in your Mistral plan (0 requests/minute allowed). "
-                              f'Set model = "{DEFAULT_MISTRAL_MODEL}" in .streamlit/secrets.toml and restart the app.')
+                raise AIError(f"Model '{self.model}' is not included in your {self.label} plan "
+                              f"(0 requests/minute allowed). Choose another model in .streamlit/secrets.toml.")
             if r.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
-                retry_after = r.headers.get("Retry-After") if hasattr(r, "headers") else None
+                retry_after = r_headers.get("Retry-After") or r_headers.get("retry-after")
                 delay = float(retry_after) if retry_after and retry_after.replace(".", "").isdigit() else 2 ** attempt
                 time.sleep(min(delay, 30))
                 continue
-            if r.status_code == 401:
-                raise AIError("The Mistral API key is invalid. Check MISTRAL_API_KEY in .streamlit/secrets.toml.")
+            if r.status_code in (401, 403) and "tier" not in r.text.lower():
+                detail = _LLMHTTPError(r.status_code, r.text[:500]).message
+                raise AIError(f"The {self.label} API key is invalid or not allowed ({r.status_code}): {detail}. "
+                              "Check the key in .streamlit/secrets.toml.")
             if r.status_code == 429:
-                raise AIError("Mistral's rate limit was reached (the free tier allows few requests per minute). "
-                              "Please wait a minute and try again.")
+                raise AIError(f"{self.label}'s rate limit was reached (free tiers allow only a few requests per "
+                              "minute/day). Please wait a minute and try again.")
             if r.status_code >= 400:
-                raise _MistralHTTPError(r.status_code, r.text[:500])
+                raise _LLMHTTPError(r.status_code, r.text[:500])
             return r.json()
-        raise AIError("The Mistral API did not respond. Please try again.")
+        raise AIError(f"The {self.label} API did not respond. Please try again.")
+
+    def _response_format(self, schema: dict) -> dict | None:
+        if self.format_mode == "json_schema":
+            return {"type": "json_schema", "json_schema": {"name": "result", "schema": schema, "strict": True}}
+        if self.format_mode == "json_object":
+            return {"type": "json_object"}
+        return None   # the model can't constrain output: rely on the prompt + tolerant parsing
 
     def json(self, system: str, user: str | None, schema: dict, max_tokens: int = 32000,
              messages: list[dict] | None = None) -> dict:
         convo = messages if messages is not None else [{"role": "user", "content": user}]
-        schema_text = ("\n\nReturn ONLY a JSON object that follows this JSON schema exactly:\n"
-                       + json.dumps(schema))
-        for attempt in range(2):
+        schema_text = ("\n\nReturn ONLY a JSON object (no markdown, no explanation) that follows this JSON schema "
+                       "exactly:\n" + json.dumps(schema))
+        for attempt in range(4):
             body = {
                 "model": self.model,
                 "temperature": self.temperature,
                 "max_tokens": max_tokens,
                 "messages": [{"role": "system", "content": system + schema_text}] + self._merge_roles(convo),
-                "response_format": ({"type": "json_schema",
-                                     "json_schema": {"name": "result", "schema": schema, "strict": True}}
-                                    if self.schema_mode else {"type": "json_object"}),
             }
+            fmt = self._response_format(schema)
+            if fmt:
+                body["response_format"] = fmt
             try:
                 data = self._post(body)
-            except _MistralHTTPError as e:
-                if self.schema_mode and e.status in (400, 422):
-                    self.schema_mode = False   # schema not accepted: retry in JSON mode
+            except _LLMHTTPError as e:
+                if e.status in (400, 422) and self.format_mode != "none" and not _is_model_error(e.text):
+                    # this provider/model rejected the output format: try a simpler one
+                    self.format_mode = "json_object" if self.format_mode == "json_schema" else "none"
                     continue
                 if e.status == 403 and "tier" in e.text.lower():
-                    raise AIError(f"Model '{self.model}' is not available on your Mistral plan. Set "
-                                  f'model = "{DEFAULT_MISTRAL_MODEL}" in .streamlit/secrets.toml and restart the app.')
-                if e.status == 404 or "model" in e.text.lower() and e.status == 400:
-                    raise AIError(f"Mistral model '{self.model}' was not found. Check `model` in secrets.toml.")
-                raise AIError(f"The Mistral API returned an error ({e.status}): {e.message}")
+                    default = PROVIDERS.get(self.provider, {}).get("model")
+                    raise AIError(f"Model '{self.model}' is not available on your {self.label} plan. "
+                                  + (f'Set model = "{default}" ' if default else "Choose another model ")
+                                  + "in .streamlit/secrets.toml and restart the app.")
+                if e.status == 404 or (e.status == 400 and _is_model_error(e.text)):
+                    raise AIError(f"{self.label} model '{self.model}' was not found. Check `model` in secrets.toml.")
+                raise AIError(f"The {self.label} API returned an error ({e.status}): {e.message}")
             choice = (data.get("choices") or [{}])[0]
             if choice.get("finish_reason") == "length":
                 raise AIError("The AI response was too long. Try asking for fewer widgets.")
@@ -185,12 +237,27 @@ class MistralLLM:
         raise AIError("The AI returned an invalid response. Please try again.")
 
 
-class _MistralHTTPError(Exception):
+class MistralLLM(OpenAICompatLLM):
+    """Mistral, kept as a named client (same OpenAI-style API as the other providers)."""
+
+    def __init__(self, api_key: str | None, model: str = DEFAULT_MISTRAL_MODEL, temperature: float = 0.2):
+        super().__init__("mistral", api_key, model, temperature=temperature)
+
+
+def _is_model_error(text: str) -> bool:
+    t = text.lower()
+    return "model" in t and any(w in t for w in ("not found", "does not exist", "invalid model", "unknown model",
+                                                  "no endpoints", "decommissioned"))
+
+
+class _LLMHTTPError(Exception):
     def __init__(self, status: int, text: str):
         super().__init__(f"{status}: {text}")
         self.status, self.text = status, text
         try:
-            self.message = json.loads(text).get("message") or text
+            body = json.loads(text)
+            err = body.get("error")
+            self.message = (err.get("message") if isinstance(err, dict) else err) or body.get("message") or text
         except (json.JSONDecodeError, AttributeError):
             self.message = text
 
@@ -213,13 +280,50 @@ def _parse_json(text: str) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def make_llm(provider: str, api_key: str | None, model: str | None = None):
-    """Create the configured AI client ('mistral' or 'anthropic')."""
-    if provider == "mistral":
-        return MistralLLM(api_key, model or DEFAULT_MISTRAL_MODEL)
+def provider_key_name(provider: str) -> str | None:
+    """Name of the secret / environment variable that holds this provider's API key."""
+    if provider == "anthropic":
+        return "ANTHROPIC_API_KEY"
+    return PROVIDERS.get(provider, PROVIDERS["openai_compatible"])["key"]
+
+
+def make_llm(provider: str, api_key: str | None, model: str | None = None, base_url: str | None = None):
+    """Create the configured AI client: 'anthropic', or any OpenAI-compatible provider in PROVIDERS."""
     if provider == "anthropic":
         return ClaudeLLM(api_key, model or DEFAULT_MODEL)
-    raise AIError(f"Unknown AI provider '{provider}'. Use 'mistral' or 'anthropic' in secrets.toml.")
+    if provider == "mistral" and not base_url:
+        return MistralLLM(api_key, model or DEFAULT_MISTRAL_MODEL)
+    if provider in PROVIDERS:
+        return OpenAICompatLLM(provider, api_key, model, base_url)
+    raise AIError(f"Unknown AI provider '{provider}'. Use one of: anthropic, {', '.join(PROVIDERS)}.")
+
+
+class FallbackLLM:
+    """Tries several providers in order: when one is rate-limited or unreachable, the next one answers.
+    Lets small free tiers (e.g. Groq + Google + OpenRouter) add up to more daily capacity."""
+
+    SWITCH_ON = ("rate limit", "did not respond", "could not reach", "not included in your", "not available on your",
+                 "returned an error (5", "insufficient credits", "quota")
+
+    def __init__(self, clients: list):
+        if not clients:
+            raise AIError("No AI provider is configured. Add an API key to .streamlit/secrets.toml.")
+        self.clients = clients
+
+    def __getattr__(self, name):
+        return getattr(self.clients[0], name)
+
+    def json(self, system: str, user: str | None, schema: dict, max_tokens: int = 32000,
+             messages: list[dict] | None = None) -> dict:
+        errors = []
+        for client in self.clients:
+            try:
+                return client.json(system, user, schema, max_tokens=max_tokens, messages=messages)
+            except AIError as e:
+                errors.append(str(e))
+                if not any(s in str(e).lower() for s in self.SWITCH_ON):
+                    raise   # a real error (bad key, bad request): don't hide it behind another provider
+        raise AIError("All AI providers are busy right now. " + " | ".join(errors))
 
 
 class PersonaLLM:

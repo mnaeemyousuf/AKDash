@@ -13,17 +13,35 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill it in:
+Copy `.streamlit/secrets.toml.example` to `.streamlit/secrets.toml` and fill it in. On Render, set the same
+names as Environment Variables. `secrets.toml` is in `.gitignore`, so keys are never committed.
+
+### Choosing the AI (open-source models supported)
+
+AKDash works with any OpenAI-compatible API, so you can run it on **free, open-source models**:
+
+| `provider` | Models (defaults) | Key | Cost |
+|---|---|---|---|
+| `gemini` | Google's open **Gemma** models (`gemma-3-27b-it`) | `GEMINI_API_KEY` from aistudio.google.com | Free tier |
+| `groq` | `openai/gpt-oss-120b`, Llama, Qwen | `GROQ_API_KEY` from console.groq.com | Free tier (small daily token cap) |
+| `openrouter` | `openai/gpt-oss-120b:free` and other `:free` models | `OPENROUTER_API_KEY` from openrouter.ai | Free models; the daily limit rises after a one-time $10 credit |
+| `ollama` | Any model you pull, e.g. `qwen3:14b`, `gpt-oss:20b` | None | Free and private; needs a capable machine |
+| `openai_compatible` | vLLM, LM Studio, etc. (`base_url` + `model`) | `LLM_API_KEY` | Depends |
+| `mistral` / `anthropic` | Mistral / Claude models | `MISTRAL_API_KEY` / `ANTHROPIC_API_KEY` | Paid / free tiers |
+
+- **Combining free tiers:** set `fallback_providers = "groq,openrouter"`. When the main provider is rate-limited, the next one answers. Only providers that have a key are used.
+- **Output format:** the app asks for JSON-schema output first, falls back to JSON mode, and finally to plain-prompt JSON. This lets models without structured-output support still work.
 
 ```toml
-provider = "mistral"                 # or "anthropic"
-MISTRAL_API_KEY = "your-key"
-model = "ministral-14b-latest"       # free tier; use mistral-large-latest on a paid plan
+provider = "gemini"
+GEMINI_API_KEY = "your-key"
+model = "gemma-3-27b-it"
+fallback_providers = "groq,openrouter"
+GROQ_API_KEY = "your-groq-key"
 signup_code = ""                     # optional: a code required to create new accounts
 ```
 
-To use Claude instead, set `provider = "anthropic"`, `ANTHROPIC_API_KEY` and a Claude model (for example `claude-sonnet-5-5`).
-`secrets.toml` is in `.gitignore`, so the key is never committed.
+**Privacy:** free tiers may log prompts or use them to improve the provider's models. The AI sees the data profile, sample rows and aggregated results. For confidential company data, use a paid tier with a no-training policy, or `ollama` on your own server.
 
 ## Run
 
