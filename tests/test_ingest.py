@@ -71,6 +71,34 @@ def test_parse_number(text, expected):
     assert ingest.parse_number(text) == expected
 
 
+def test_vectorized_parse_numbers_matches_scalar():
+    values = ["1,200", "Rs 500", "PKR 1,000.50", "(300)", "15%", "-42", "$ 9", "abc", "12-01-2026", None,
+              7, 3.5, True, "", "  88  ", "(1,234.5)", "-(5)", "Rs. 1,000", "1.2.3", ".5", "500 PKR"]
+    got = ingest.parse_numbers(pd.Series(values, dtype=object)).tolist()
+    for v, g in zip(values, got):
+        expected = ingest.parse_number(v)
+        assert (expected is None and pd.isna(g)) or g == expected, (v, g, expected)
+
+
+def test_big_csv_is_fast():
+    import time
+    rows = "\n".join(f"{i},{(i % 28) + 1:02d}/0{(i % 9) + 1}/2026,Region {i % 5},\"{i * 10:,}\"" for i in range(30_000))
+    data = f"Report\n\nID,Date,Region,Amount\n{rows}\nGrand Total,,,\n".encode()
+    t0 = time.perf_counter()
+    tables, _ = ingest.ingest_files([("big.csv", data)])
+    assert time.perf_counter() - t0 < 15
+    df = tables[0].df
+    assert len(df) == 30_000 and tables[0].column_types["date"] == "date"
+    assert df["amount"].sum() == sum(i * 10 for i in range(30_000))
+
+
+def test_too_many_rows_gives_friendly_error(monkeypatch):
+    monkeypatch.setattr(ingest, "MAX_ROWS", 100)
+    data = ("a,b\n" + "\n".join(f"{i},{i}" for i in range(200))).encode()
+    with pytest.raises(ingest.IngestError, match="limit on this server is 100 rows"):
+        ingest.ingest_files([("big.csv", data)])
+
+
 @pytest.mark.parametrize("text,expected", [
     ("Order Date", "order_date"), ("Amount (Rs)", "amount_rs"), ("  Qty# ", "qty_no"),
     ("2026 Sales", "c_2026_sales"), (None, "column"), ("Growth %", "growth_pct"),

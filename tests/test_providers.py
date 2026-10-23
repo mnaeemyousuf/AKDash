@@ -140,7 +140,7 @@ def test_groq_skips_requests_too_large_for_free_tier(http):
 def test_chain_mistral_gemini_groq_with_big_request(http):
     """Mistral rate-limited -> Gemini answers; Groq is never tried for a big request."""
     calls, queue = http
-    queue += [FakeResponse(429, {"message": "rate limit"})] * 6 + [ok('{"by": "gemini"}')]
+    queue += [FakeResponse(429, {"message": "rate limit"})] * 3 + [ok('{"by": "gemini"}')]   # 3 tries, then backup
     llm = ai.FallbackLLM([ai.make_llm("mistral", "k"), ai.make_llm("gemini", "k"), ai.make_llm("groq", "k")])
     assert llm.json("x" * 40_000, "u", {}) == {"by": "gemini"}
     assert llm.used == ["Google AI Studio"]
@@ -149,8 +149,8 @@ def test_chain_mistral_gemini_groq_with_big_request(http):
 
 def test_chain_reaches_groq_for_small_request(http):
     calls, queue = http
-    queue += ([FakeResponse(429, {"message": "rate limit"})] * 6
-              + [FakeResponse(429, {"error": {"message": "quota exceeded"}})] * 6 + [ok('{"by": "groq"}')])
+    queue += ([FakeResponse(429, {"message": "rate limit"})] * 3
+              + [FakeResponse(429, {"error": {"message": "quota exceeded"}})] * 3 + [ok('{"by": "groq"}')])
     llm = ai.FallbackLLM([ai.make_llm("mistral", "k"), ai.make_llm("gemini", "k"), ai.make_llm("groq", "k")])
     assert llm.json("small", "u", {}) == {"by": "groq"}
     assert llm.used == ["Groq"]

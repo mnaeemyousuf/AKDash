@@ -5,6 +5,9 @@
 [client]
 toolbarMode = "minimal"          # hide the developer toolbar / Deploy button
 
+[server]
+maxUploadSize = 50               # MB per file; bigger files need more RAM than a small server has
+
 [theme]
 font = "Inter:https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap, sans-serif"
 headingFontWeights = [700, 650, 600]

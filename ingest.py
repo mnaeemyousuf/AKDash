@@ -15,6 +15,7 @@ from __future__ import annotations
 import csv
 import datetime as dt
 import io
+import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,6 +39,8 @@ RESERVED = {"select", "from", "where", "group", "order", "by", "table", "limit",
             "user", "case", "when", "end", "date", "time", "year", "month", "values", "default"}
 # ratio of parseable values needed to convert a column
 CONVERT_THRESHOLD = 0.95
+# rows per sheet: ~500K rows need ~700 MB of RAM to clean, more than a small (512 MB) server has
+MAX_ROWS = int(os.environ.get("AKDASH_MAX_ROWS", "300000"))
 
 
 class IngestError(Exception):
@@ -109,10 +112,6 @@ def _is_empty(v) -> bool:
         return False
 
 
-def _is_placeholder(v) -> bool:
-    return isinstance(v, str) and v.strip().lower() in PLACEHOLDERS
-
-
 def parse_number(v):
     """Return a float for numbers and numeric text, else None."""
     if isinstance(v, bool):
@@ -142,6 +141,53 @@ def parse_number(v):
     return -num if negative else num
 
 
+def _blank_mask(s: pd.Series) -> pd.Series:
+    """True where a cell is empty (None/NaN/whitespace). Vectorized: fast on big sheets."""
+    return s.astype("string").str.strip().fillna("").eq("")
+
+
+def parse_numbers(s: pd.Series) -> pd.Series:
+    """Vectorized parse_number for a whole column: float Series, NaN where a value isn't a number."""
+    obj = s.astype(object)
+    types = obj.map(type)
+    is_num = types.map(lambda t: issubclass(t, (int, float)) and t is not bool).astype(bool)
+    is_str = types.eq(str)
+    out = pd.Series(float("nan"), index=s.index, dtype="float64")
+    if is_num.any():
+        out[is_num] = pd.to_numeric(obj[is_num], errors="coerce").astype("float64")
+    if is_str.any():
+        t = obj[is_str].astype("string").str.strip()
+        neg = t.str.match(r"^\(.*\)$").fillna(False).astype(bool)
+        t = t.str.replace(r"^\((.*)\)$", r"\1", regex=True).str.strip()
+        t = t.str.replace(CURRENCY_RE, "", regex=True).str.strip()
+        pct = t.str.endswith("%").fillna(False).astype(bool)
+        t = t.str.replace(r"%$", "", regex=True).str.strip()
+        t = t.str.replace(",", "", regex=False).str.replace(" ", "", regex=False)
+        minus = t.str.startswith("-").fillna(False).astype(bool)
+        t = t.str.replace(r"^-", "", regex=True)
+        valid = t.str.fullmatch(r"\d+(\.\d+)?|\.\d+").fillna(False).astype(bool)
+        nums = pd.to_numeric(t.where(valid), errors="coerce").astype("float64")
+        nums = nums.where(~pct, nums / 100)
+        nums = nums.where(~(neg ^ minus), -nums)
+        out[is_str] = nums
+    return out
+
+
+DATE_FORMATS = ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%b-%Y", "%d %b %Y", "%d-%b-%y", "%m/%d/%Y"]
+
+
+def _parse_date_text(strs: pd.Series, needed: int) -> pd.Series:
+    """ISO first, then common day-first formats (fast, exact), then a slower mixed-format parse."""
+    out = pd.to_datetime(strs, format="ISO8601", errors="coerce")
+    if out.notna().sum() >= needed:
+        return out
+    for fmt in DATE_FORMATS:
+        out = pd.to_datetime(strs, format=fmt, errors="coerce")
+        if out.notna().sum() >= needed:
+            return out
+    return pd.to_datetime(strs, format="mixed", dayfirst=True, errors="coerce")
+
+
 def type_label(s: pd.Series) -> str:
     if pd.api.types.is_datetime64_any_dtype(s):
         return "date"
@@ -161,8 +207,12 @@ def read_file(name: str, data: bytes) -> dict[str, pd.DataFrame]:
         return read_pdf(name, data)[0]
     try:
         if suffix in (".xlsx", ".xlsm"):
-            return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object,
-                                 engine="openpyxl")
+            try:   # calamine (Rust) reads big workbooks ~10x faster; openpyxl is the fallback
+                return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object,
+                                     engine="calamine")
+            except ImportError:
+                return pd.read_excel(io.BytesIO(data), sheet_name=None, header=None, dtype=object,
+                                     engine="openpyxl")
         if suffix == ".csv":
             return {"csv": _read_csv(name, data)}
     except IngestError:
@@ -252,58 +302,63 @@ def detect_header_row(raw: pd.DataFrame, max_scan: int = 30) -> int:
 
 
 def _drop_empty(raw: pd.DataFrame) -> pd.DataFrame:
-    mask = raw.map(lambda v: not _is_empty(v))
-    return raw.loc[mask.any(axis=1), mask.any(axis=0)].reset_index(drop=True)
+    filled = ~raw.apply(_blank_mask)
+    return raw.loc[filled.any(axis=1), filled.any(axis=0)].reset_index(drop=True)
+
+
+SAMPLE_SIZE = 2000   # a column's type is guessed from its first values, then checked on the whole column
 
 
 def _convert_column(s: pd.Series, name: str) -> tuple[pd.Series, str | None]:
-    """Convert one object column to the best type. Returns (series, note)."""
-    values = s.map(lambda v: pd.NA if _is_empty(v) or _is_placeholder(v) else v)
-    present = values.dropna()
-    if present.empty:
-        return values.astype("string"), None
+    """Convert one object column to the best type. Returns (series, note). Vectorized for big sheets."""
+    text_all = s.astype("string").str.strip()
+    blank = (text_all.fillna("").eq("") | text_all.str.lower().isin(PLACEHOLDERS).fillna(False)).astype(bool)
+    values = s.where(~blank)
+    present = values[~blank]
+    n = len(present)
+    if n == 0:
+        return pd.Series(pd.NA, index=s.index, dtype="string"), None
+    sample = present.iloc[:SAMPLE_SIZE]
+    needed = CONVERT_THRESHOLD * n
 
     # 1. real date cells from Excel
-    is_dt = present.map(lambda v: isinstance(v, (dt.datetime, dt.date, pd.Timestamp)))
-    if is_dt.mean() >= CONVERT_THRESHOLD:
-        out = pd.to_datetime(values.where(values.map(lambda v: isinstance(v, (dt.datetime, dt.date, pd.Timestamp)))),
-                             errors="coerce")
-        return out, _lost_note(present, out)
+    is_date = lambda v: isinstance(v, (dt.datetime, dt.date, pd.Timestamp))  # noqa: E731
+    if sample.map(is_date).mean() >= CONVERT_THRESHOLD:
+        dates = values.map(is_date).astype(bool)
+        if dates[~blank].mean() >= CONVERT_THRESHOLD:
+            out = pd.to_datetime(values.where(dates), errors="coerce")
+            return out, _lost_note(present, out)
 
     # 2. numbers / numeric text
-    nums = present.map(parse_number)
-    if nums.notna().mean() >= CONVERT_THRESHOLD:
-        out = values.map(lambda v: None if _is_empty(v) else parse_number(v)).astype("float64")
-        # 2a. Excel serial dates in a date-named column
-        valid = out.dropna()
-        if DATE_NAME_RE.search(name) and len(valid) and valid.between(20000, 60000).all():
-            out = pd.to_datetime(out, unit="D", origin="1899-12-30").dt.round("s")
-            return out, "converted from Excel date numbers"
-        if len(valid) and (valid == valid.round()).all() and valid.abs().max() < 2**53:
-            out = out.astype("Int64")
-        return out, _lost_note(present, out)
+    if parse_numbers(sample).notna().mean() >= CONVERT_THRESHOLD:
+        out = parse_numbers(values)
+        if out[~blank].notna().sum() >= needed:
+            # 2a. Excel serial dates in a date-named column
+            valid = out.dropna()
+            if DATE_NAME_RE.search(name) and len(valid) and valid.between(20000, 60000).all():
+                out = pd.to_datetime(out, unit="D", origin="1899-12-30").dt.round("s")
+                return out, "converted from Excel date numbers"
+            if len(valid) and (valid == valid.round()).all() and valid.abs().max() < 2**53:
+                out = out.astype("Int64")
+            return out, _lost_note(present, out)
 
+    text = text_all[~blank]
     # 3. date text
-    text = present.astype(str)
-    if text.map(lambda v: bool(DATE_TEXT_RE.match(v))).mean() >= CONVERT_THRESHOLD:
-        iso = pd.to_datetime(text, format="ISO8601", errors="coerce")
-        if iso.notna().mean() >= CONVERT_THRESHOLD:
-            out = pd.to_datetime(values.astype("string"), format="ISO8601", errors="coerce")
-        else:
-            out = pd.to_datetime(values.astype("string"), format="mixed", dayfirst=True, errors="coerce")
-        if out.notna().sum() >= CONVERT_THRESHOLD * len(present):
+    if (text.iloc[:SAMPLE_SIZE].str.match(DATE_TEXT_RE).mean() >= CONVERT_THRESHOLD
+            and text.str.match(DATE_TEXT_RE).mean() >= CONVERT_THRESHOLD):
+        out = _parse_date_text(text_all.where(~blank), needed)
+        if out.notna().sum() >= needed:
             return out, _lost_note(present, out)
 
     # 3b. month text ("2026-07", "Jul 2026", "July-26") -> first day of the month
-    if text.map(lambda v: bool(MONTH_TEXT_RE.match(v))).mean() >= CONVERT_THRESHOLD:
-        out = values.map(lambda v: pd.NA if _is_empty(v) else _parse_month(str(v)))
-        out = pd.to_datetime(out, errors="coerce")
-        if out.notna().sum() >= CONVERT_THRESHOLD * len(present):
+    if text.str.match(MONTH_TEXT_RE).mean() >= CONVERT_THRESHOLD:
+        months = {v: _parse_month(v) for v in text.unique()}   # few distinct months: parse each once
+        out = pd.to_datetime(text_all.where(~blank).map(months), errors="coerce")
+        if out.notna().sum() >= needed:
             return out, "month values converted to the first day of each month"
 
     # 4. text
-    out = values.map(lambda v: pd.NA if _is_empty(v) else str(v).strip()).astype("string")
-    return out, None
+    return text_all.where(~blank), None
 
 
 def _parse_month(s: str):
@@ -340,21 +395,21 @@ def clean_sheet(raw: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     cols = unique_names([snake_case(v, fallback=f"column_{i + 1}") for i, v in enumerate(header)])
     body.columns = cols
 
+    lowered = body.apply(lambda c: c.astype("string").str.strip().str.lower().fillna(""))
+
     # repeated header rows (e.g. exports with a header on each page)
-    header_text = [str(v).strip().lower() for v in header]
-    is_repeat = body.apply(lambda r: [str(v).strip().lower() for v in r.tolist()] == header_text, axis=1)
+    header_text = ["" if _is_empty(v) else str(v).strip().lower() for v in header]
+    is_repeat = lowered.eq(header_text).all(axis=1) if len(body) else pd.Series(dtype=bool)
 
     # total rows: a label in one of the first 3 columns starting with "total"/"grand total"/"subtotal"
-    first_cols = cols[:3]
-    is_total = body[first_cols].apply(
-        lambda r: any(isinstance(v, str) and TOTAL_RE.match(v) for v in r.tolist()), axis=1
-    ) if len(body) else pd.Series(dtype=bool)
+    is_total = pd.Series(False, index=body.index)
+    for c in cols[:3]:
+        is_total |= lowered[c].str.match(TOTAL_RE).fillna(False).astype(bool)
 
-    body = body.loc[~(is_repeat | is_total)] if len(body) else body
-    report["total_rows_removed"] = int(is_total.sum()) if len(is_total) else 0
-    report["repeated_headers_removed"] = int(is_repeat.sum()) if len(is_repeat) else 0
-
-    body = body.loc[body.map(lambda v: not _is_empty(v)).any(axis=1)].reset_index(drop=True)
+    keep = ~(is_repeat | is_total) & ~lowered.eq("").all(axis=1)
+    report["total_rows_removed"] = int(is_total.sum())
+    report["repeated_headers_removed"] = int(is_repeat.sum())
+    body = body.loc[keep].reset_index(drop=True)
 
     notes = {}
     df = pd.DataFrame(index=body.index)
@@ -403,6 +458,9 @@ def ingest_upload(files: list[tuple[str, bytes]], text_extractor=None) -> Ingest
         else:
             sheets = read_file(fname, data)
         for sheet, raw in sheets.items():
+            if len(raw) > MAX_ROWS:
+                raise IngestError(f"'{fname} / {sheet}' has {len(raw):,} rows. The limit on this server is "
+                                  f"{MAX_ROWS:,} rows per sheet. Please split the file (e.g. by month) or filter it.")
             df, report = clean_sheet(raw)
             if df.empty or len(df.columns) == 0:
                 warnings.append(f"'{fname} / {sheet}' has no data rows and was skipped.")

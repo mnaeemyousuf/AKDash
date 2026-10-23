@@ -24,9 +24,9 @@ class QueryError(Exception):
 # ---------- SELECT-only check ----------
 
 def _strip_comments_and_strings(sql: str) -> str:
-    sql = re.sub(r"--[^\n]*", " ", sql)
-    sql = re.sub(r"/\*.*?\*/", " ", sql, flags=re.DOTALL)
-    return re.sub(r"'(?:[^']|'')*'", "''", sql)
+    # one left-to-right pass, so "--" or ";" inside a string isn't mistaken for a comment or a second statement
+    return re.sub(r"'(?:[^']|'')*'|--[^\n]*|/\*.*?\*/",
+                  lambda m: "''" if m.group(0).startswith("'") else " ", sql, flags=re.DOTALL)
 
 
 def validate_select(sql: str) -> str:
@@ -85,25 +85,41 @@ def apply_filters(tables: dict[str, pd.DataFrame], filters: Filters | None) -> d
 
 # ---------- execution ----------
 
+QUERY_TIMEOUT_S = 20          # a runaway query (e.g. a huge cross join) is stopped instead of freezing the app
+QUERY_MEMORY_LIMIT = "256MB"  # Render's small instances have 512 MB in total
+
+
 def connect(tables: dict[str, pd.DataFrame]) -> duckdb.DuckDBPyConnection:
-    con = duckdb.connect(":memory:", config={"enable_external_access": False})
+    con = duckdb.connect(":memory:", config={"enable_external_access": False,
+                                             "memory_limit": QUERY_MEMORY_LIMIT, "threads": 2})
     for name, df in tables.items():
         con.register(name, df)
     con.execute("SET lock_configuration = true")
     return con
 
 
-def run_query(con: duckdb.DuckDBPyConnection, sql: str, max_rows: int = MAX_RESULT_ROWS) -> pd.DataFrame:
+def run_query(con: duckdb.DuckDBPyConnection, sql: str, max_rows: int = MAX_RESULT_ROWS,
+              timeout: float = QUERY_TIMEOUT_S) -> pd.DataFrame:
+    import threading
     sql = validate_select(sql)
+    timer = threading.Timer(timeout, con.interrupt)
+    timer.start()
     try:
         rel = con.sql(sql)
         df = rel.limit(max_rows).df() if rel is not None else pd.DataFrame()
+    except duckdb.InterruptException as e:
+        raise QueryError(f"The query took longer than {timeout:.0f} seconds and was stopped. "
+                         "Try a simpler question or filter the data.") from e
+    except duckdb.OutOfMemoryException as e:
+        raise QueryError("The query needed too much memory and was stopped. Try a simpler question.") from e
     except duckdb.Error as e:
         msg = str(e).split("\n\nLINE")[0].strip()
         missing = re.search(r"Table with name (\S+) does not exist", msg)
         if missing:
             msg = f"Table '{missing.group(1)}' is not in the current data (it was not in the latest upload)."
         raise QueryError(msg) from e
+    finally:
+        timer.cancel()
     return df
 
 

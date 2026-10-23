@@ -135,6 +135,7 @@ class OpenAICompatLLM:
         self.temperature = temperature
         self.min_interval = preset["min_interval"]
         self.request_tokens = preset.get("request_tokens")     # free-tier cap on prompt + answer, if any
+        self.max_attempts = 6   # retries on rate limits / server errors (fewer when a backup provider exists)
         self.timeout = 900 if provider == "ollama" else 300   # local models can be slow
         # response_format support differs per provider/model: json_schema -> json_object -> plain prompt
         self.format_mode = "json_schema"
@@ -165,7 +166,7 @@ class OpenAICompatLLM:
             headers["Authorization"] = f"Bearer {self.api_key}"
         if self.provider == "openrouter":
             headers["X-Title"] = "AKDash"
-        attempts = 6
+        attempts = self.max_attempts
         for attempt in range(attempts):
             # free tiers allow only a few requests per minute: keep calls to one provider spaced out
             wait = _LAST_CALL.get(self.provider, 0.0) + self.min_interval - time.monotonic()
@@ -358,6 +359,9 @@ class FallbackLLM:
         if not clients:
             raise AIError("No AI provider is configured. Add an API key to .streamlit/secrets.toml.")
         self.clients = clients
+        for c in clients[:-1]:   # hand over to the backup after ~7s of retries instead of ~30s
+            if hasattr(c, "max_attempts"):
+                c.max_attempts = 3
         self.used: list[str] = []   # labels of the providers that answered (shown to the user)
 
     def __getattr__(self, name):

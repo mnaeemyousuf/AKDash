@@ -76,9 +76,11 @@ def _now() -> str:
 
 @contextmanager
 def connect():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout: when several users write at once, wait for the lock instead of failing with "database is locked"
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 30000")
     try:
         yield conn
         conn.commit()
@@ -88,6 +90,9 @@ def connect():
 
 def init_db() -> None:
     with connect() as conn:
+        # WAL: readers don't block writers (many users at once); the setting is stored in the database file
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.executescript(SCHEMA)
         # add columns introduced after Step 1 to existing databases
         for table, column, ddl in [("spec_versions", "note", "TEXT DEFAULT ''"),
@@ -126,6 +131,7 @@ def create_user(username: str, password_hash: str, email: str = "", full_name: s
                 role: str = "user") -> int:
     """Creates a user. The first user becomes admin and takes over projects created before login existed."""
     with connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")   # count + insert as one step: two sign-ups at once can't both be "first"
         first = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
         cur = conn.execute(
             "INSERT INTO users (username, email, full_name, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?)",

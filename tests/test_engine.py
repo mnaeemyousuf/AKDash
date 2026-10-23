@@ -62,6 +62,20 @@ def test_file_access_blocked_even_if_check_bypassed(tables):
         con.sql("SELECT * FROM read_csv('requirements.txt')").df()
 
 
+def test_runaway_query_is_stopped(tables):
+    import time
+    t0 = time.perf_counter()
+    with pytest.raises(engine.QueryError, match="took longer"):
+        con = engine.connect(tables)
+        engine.run_query(con, "SELECT COUNT(*) AS n FROM range(100000000) a, range(100000000) b", timeout=1)
+    assert time.perf_counter() - t0 < 10
+
+
+def test_semicolon_and_dashes_inside_strings_are_fine(tables):
+    df = engine.run_on_tables(tables, "SELECT 'a''; b -- c' AS s")
+    assert df["s"].iloc[0] == "a'; b -- c"
+
+
 def test_filters(tables):
     f = engine.Filters(date_column="order_date", date_range=(date(2026, 1, 1), date(2026, 1, 31)))
     out = engine.apply_filters(tables, f)
